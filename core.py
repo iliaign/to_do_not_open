@@ -17,7 +17,7 @@ TICK_RATE = 60                    # тиков симуляции в секун�
 TICK = 1.0 / TICK_RATE
 SIM_DT = TICK * SPEED_SCALE       # игровое время за один тик
 
-PLAYER_CONTROL_SPEED = 8.0        # единиц мира за тик-секунду (см. SPEED_SCALE)
+PLAYER_CONTROL_SPEED = 8.0 * 1.2  # скорость игрока (ускорен в 1.2 раза)
 WALK_SPEED = 0.6
 NEW_PLAYER_FORCED_INTERVAL = 60.0  # реальные секунды
 KICK_DURATION = 0.46
@@ -63,6 +63,7 @@ class Person:
     walk_dir: int = 1
     mx: int = 0          # текущий ввод (только для human)
     my: int = 0
+    kicks: int = 0       # личный счёт пинков
 
 
 class World:
@@ -86,6 +87,7 @@ class World:
         self.label_timer = 0.0
         self.stats = {"total": 0, "up": 0, "down": 0, "manual": 0}
 
+        self._leader = None         # pid лидера таблицы
         self.events: list = []      # звуковые события для клиентов
         self._kick_queue: list[int] = []
 
@@ -159,7 +161,20 @@ class World:
         self.label = text
         self.label_timer = EVENT_DURATION
 
-    def _count_kick(self, up: bool, manual: bool) -> None:
+    def _lead_change(self, p: Person) -> str:
+        """Текст, если после пинка p кто-то единолично вышел вперёд в таблице."""
+        cands = [q for q in self.persons.values() if q.kind in ("human", "bot")]
+        if p not in cands:
+            return ""
+        top = max(q.kicks for q in cands)
+        leaders = [q for q in cands if q.kicks == top]
+        if top >= 2 and len(leaders) == 1 and leaders[0].pid != self._leader:
+            self._leader = leaders[0].pid
+            return f"{leaders[0].name.upper()} ВПЕРЕДИ!"
+        return ""
+
+    def _count_kick(self, p: Person, up: bool, manual: bool) -> None:
+        p.kicks += 1
         self.stats["total"] += 1
         self.stats["up" if up else "down"] += 1
         if manual:
@@ -188,7 +203,10 @@ class World:
         self.vy += p.kick_lift * rng.uniform(6.0, 9.5)
         self.av += rng.uniform(-230.0, 230.0) + p.kick_lift * 75.0
         events = ["UP KICK" if p.kick_lift > 0 else "DOWN KICK"]
-        self._count_kick(p.kick_lift > 0, manual=False)
+        self._count_kick(p, p.kick_lift > 0, manual=False)
+        lead = self._lead_change(p)
+        if lead:
+            events.append(lead)
 
         if self.boost_hits > 0:
             self.boost_hits -= 1
@@ -223,8 +241,10 @@ class World:
         self.vx = side * max(abs(self.vx), 10.0)
         self.vy += p.kick_lift * rng.uniform(6.0, 9.5)
         self.av += rng.uniform(-230.0, 230.0) + p.kick_lift * 75.0
-        self._count_kick(p.kick_lift > 0, manual=True)
-        self._set_label("MANUAL " + ("UP KICK" if p.kick_lift > 0 else "DOWN KICK"))
+        self._count_kick(p, p.kick_lift > 0, manual=True)
+        text = "MANUAL " + ("UP KICK" if p.kick_lift > 0 else "DOWN KICK")
+        lead = self._lead_change(p)
+        self._set_label(text + ("   " + lead if lead else ""))
 
     def _move_human(self, p: Person, dt: float) -> None:
         if p.mx:
@@ -321,7 +341,7 @@ class World:
             "o": [round(self.x, 3), round(self.y, 3), round(self.angle, 2),
                   round(self.vx, 3), round(self.vy, 3), round(self.av, 2), self.mult],
             "p": [[p.pid, round(p.x, 3), round(p.ground_y, 3), p.facing, p.color,
-                   round(p.kick_timer, 3), p.kick_lift, p.kind, p.name]
+                   round(p.kick_timer, 3), p.kick_lift, p.kind, p.name, p.kicks]
                   for p in self.persons.values()],
             "st": [self.stats["total"], self.stats["up"],
                    self.stats["down"], self.stats["manual"]],

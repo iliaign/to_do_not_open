@@ -292,7 +292,7 @@ def draw_person(surf, pr: dict, t: float) -> None:
                                 [(bx - 6, by - 26), (bx + 6, by - 26), (bx, by - 15)])
 
 
-def draw_sidebar(screen, base, my_id, mode_lines) -> None:
+def draw_sidebar(screen, base, my_id, mode_lines, server_addr=None) -> None:
     pygame.draw.rect(screen, C_PANEL, SIDE_RECT)
     cx = SIDE_RECT.centerx
 
@@ -300,35 +300,55 @@ def draw_sidebar(screen, base, my_id, mode_lines) -> None:
         return SIDE_RECT.top + (1 - f) * SIDE_RECT.height
 
     draw_text(screen, "СПРАВКА", 26, C_TEXT, (cx, sy(0.97)), "midtop", True)
-    draw_text(screen, "— СЧЁТЧИК КИКОВ —", 18, C_GOLD, (cx, sy(0.88)), "midtop", True)
+
+    # --- общий счётчик
+    draw_text(screen, "— СЧЁТЧИК КИКОВ —", 18, C_GOLD, (cx, sy(0.91)), "midtop", True)
     total, up, down, manual = base["st"] if base else (0, 0, 0, 0)
-    draw_text(screen, str(total), 40, C_TEXT, (cx, sy(0.82)), "midtop", True)
+    draw_text(screen, str(total), 36, C_TEXT, (cx, sy(0.87)), "midtop", True)
     for i, line in enumerate((f"UP     {up:>4}", f"DOWN   {down:>4}",
                               f"MANUAL {manual:>4}")):
-        draw_text(screen, line, 17, (203, 213, 225), (cx, sy(0.72) + i * 26), "midtop")
+        draw_text(screen, line, 16, (203, 213, 225), (cx, sy(0.79) + i * 23), "midtop")
 
-    draw_text(screen, "— УПРАВЛЕНИЕ —", 18, C_GOLD, (cx, sy(0.60)), "midtop", True)
-    for i, line in enumerate(("W / ВВЕРХ", "S / ВНИЗ", "A / ВЛЕВО", "D / ВПРАВО",
-                              "ПРОБЕЛ  пинок", "ESC     меню")):
-        draw_text(screen, line, 17, (226, 232, 240), (cx, sy(0.53) + i * 27), "midtop")
-
-    draw_text(screen, "— ИГРОКИ —", 18, C_GOLD, (cx, sy(0.31)), "midtop", True)
-    y = sy(0.25)
-    npc = 0
+    # --- таблица лидеров
+    draw_text(screen, "— ТАБЛИЦА —", 18, C_GOLD, (cx, sy(0.62)), "midtop", True)
+    rows, npc = [], 0
     if base:
-        for pid, _x, _y, _f, color, _kt, _kl, kind, name in base["p"]:
+        for pid, _x, _y, _f, color, _kt, _kl, kind, name, kicks in base["p"]:
             if kind == "npc":
                 npc += 1
-                continue
-            r = pygame.Rect(SIDE_RECT.left + 40, int(y) - 8, 18, 16)
-            pygame.draw.rect(screen, pygame.Color(color), r)
-            pygame.draw.rect(screen, C_BG, r, 1)
-            label = name + (" (ты)" if pid == my_id else "")
-            draw_text(screen, label, 16, (226, 232, 240), (r.right + 10, y), "midleft")
-            y += 30
-        if npc:
-            draw_text(screen, f"+ NPC: {npc}", 16, C_DIM,
-                      (SIDE_RECT.left + 40, y), "midleft")
+            else:
+                rows.append((kicks, pid, color, name))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    y = sy(0.56)
+    for rank, (kicks, pid, color, name) in enumerate(rows, 1):
+        me = pid == my_id
+        leader = rank == 1 and kicks > 0
+        row = pygame.Rect(SIDE_RECT.left + 14, int(y) - 14, SIDE_RECT.width - 28, 28)
+        if leader:
+            pygame.draw.rect(screen, (66, 52, 16), row, border_radius=5)
+        elif me:
+            pygame.draw.rect(screen, (30, 41, 59), row, border_radius=5)
+        draw_text(screen, f"{rank}.", 16, C_DIM, (row.left + 8, y), "midleft")
+        sw = pygame.Rect(row.left + 38, int(y) - 8, 16, 16)
+        pygame.draw.rect(screen, pygame.Color(color), sw)
+        pygame.draw.rect(screen, C_BG, sw, 1)
+        draw_text(screen, name + (" (ты)" if me else ""), 16,
+                  C_YELLOW if me else (226, 232, 240), (sw.right + 8, y), "midleft")
+        draw_text(screen, str(kicks), 18, C_GOLD if leader else C_TEXT,
+                  (row.right - 10, y), "midright", True)
+        y += 34
+    if npc:
+        draw_text(screen, f"+ NPC: {npc}", 14, C_DIM, (SIDE_RECT.left + 20, y), "midleft")
+
+    # --- адрес сервера (когда мы хост)
+    if server_addr:
+        box = pygame.Rect(SIDE_RECT.left + 14, int(sy(0.24)), SIDE_RECT.width - 28, 92)
+        pygame.draw.rect(screen, (15, 23, 42), box, border_radius=8)
+        pygame.draw.rect(screen, C_CYAN, box, 2, border_radius=8)
+        draw_text(screen, "АДРЕС СЕРВЕРА", 15, C_DIM, (cx, box.top + 8), "midtop", True)
+        draw_text(screen, server_addr, 22, C_CYAN, (cx, box.top + 32), "midtop", True)
+        draw_text(screen, "друзья вводят его в «Подключиться»", 12, C_DIM,
+                  (cx, box.top + 66), "midtop")
 
     for i, line in enumerate(reversed(mode_lines)):
         draw_text(screen, line, 14, (100, 116, 139),
@@ -356,7 +376,7 @@ def key_id(ev) -> int:
     return -ev.key
 
 
-def play(screen, clock, sfx, session, mode_lines, obj_surf) -> str:
+def play(screen, clock, sfx, session, mode_lines, obj_surf, server_addr=None) -> str:
     """Возвращает "" (выход в меню), QUIT или текст уведомления."""
     held: set[int] = set()
     last_input = None
@@ -410,7 +430,7 @@ def play(screen, clock, sfx, session, mode_lines, obj_surf) -> str:
         if base is None:
             draw_text(screen, "Ожидание данных от сервера...", 22, C_DIM,
                       GAME_RECT.center)
-            draw_sidebar(screen, None, session.my_id, mode_lines)
+            draw_sidebar(screen, None, session.my_id, mode_lines, server_addr)
             pygame.display.flip()
             continue
 
@@ -425,7 +445,7 @@ def play(screen, clock, sfx, session, mode_lines, obj_surf) -> str:
         screen.blit(rot, rot.get_rect(center=to_screen(ox, oy)))
 
         persons = []
-        for pid, x, gy, facing, color, kt, kl, kind, name in base["p"]:
+        for pid, x, gy, facing, color, kt, kl, kind, name, _kicks in base["p"]:
             me = pid == session.my_id
             if me and session.predict:
                 if local is None or abs(local[0] - x) + abs(local[1] - gy) > 4.0:
@@ -462,7 +482,7 @@ def play(screen, clock, sfx, session, mode_lines, obj_surf) -> str:
         draw_text(screen, "WASD / стрелки — двигаться     ПРОБЕЛ — пинок     ESC — меню",
                   15, C_DIM, (GAME_RECT.centerx, to_screen(0, -6.7)[1]), "center")
 
-        draw_sidebar(screen, base, session.my_id, mode_lines)
+        draw_sidebar(screen, base, session.my_id, mode_lines, server_addr)
         pygame.display.flip()
 
 
@@ -641,8 +661,10 @@ def main() -> None:
                     server.stop()
                     notice = f"Не удалось создать игру: {e}"
                     continue
-                lines = ["режим: онлайн (хост)", f"адрес: {local_ip()}:{PORT}"]
-                result = play(screen, clock, sfx, session, lines, obj_surf)
+                addr = f"{local_ip()}:{PORT}"
+                print(f"Сервер запущен. Адрес для подключения: {addr}")
+                result = play(screen, clock, sfx, session,
+                              ["режим: онлайн (хост)"], obj_surf, server_addr=addr)
                 session.close()
                 server.stop()
             elif sub == "join":

@@ -30,19 +30,51 @@ PORT = 50505
 SNAPSHOT_INTERVAL = 1.0 / 30.0
 
 
-def local_ip() -> str:
-    """Лучшая догадка о LAN-адресе этой машины (пакеты фактически не отправляются)."""
+# Если игра показывает не тот адрес — впишите сюда свой адрес из Radmin VPN,
+# например MANUAL_ADDRESS = "26.12.34.56". Пустая строка = определять автоматически.
+MANUAL_ADDRESS = ""
+
+
+def _route_ip(target: str):
+    """IP нашего интерфейса, через который идёт маршрут к target (пакеты не отправляются)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("10.255.255.255", 1))
+        s.connect((target, 1))
         ip = s.getsockname()[0]
         s.close()
         return ip
     except OSError:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except OSError:
-            return "127.0.0.1"
+        return None
+
+
+def all_local_ips() -> list[str]:
+    ips: list[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.append(info[4][0])
+    except OSError:
+        pass
+    for target in ("26.255.255.255", "10.255.255.255", "192.168.255.255"):
+        ip = _route_ip(target)
+        if ip:
+            ips.append(ip)
+    seen, result = set(), []
+    for ip in ips:
+        if ip not in seen and not ip.startswith("127."):
+            seen.add(ip)
+            result.append(ip)
+    return result
+
+
+def local_ip() -> str:
+    """Адрес для подключения друзей. Приоритет: ручной -> Radmin (26.*) -> обычный LAN."""
+    if MANUAL_ADDRESS:
+        return MANUAL_ADDRESS
+    ips = all_local_ips()
+    for ip in ips:
+        if ip.startswith("26."):          # Radmin VPN
+            return ip
+    return ips[0] if ips else "127.0.0.1"
 
 
 def _encode(msg: dict) -> bytes:

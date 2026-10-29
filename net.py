@@ -16,13 +16,23 @@ net.py — сеть и «сессии».
   * NetSession   — подключение к серверу по сети
   * LocalSession — локальный World в том же процессе (игра с ботом)
 
-Отдельный headless-сервер:  python net.py
+Выбор сети для хоста:
+  * list_interfaces() — все IPv4-адреса компьютера (Radmin VPN, Wi-Fi/Ethernet, ...)
+  * host_targets()    — готовые варианты для меню «в какой сети играем»
+  * GameServer(port, host=IP) слушает только на выбранном адаптере
+
+Отдельный headless-сервер:
+    python net.py                  — слушать на всех сетях
+    python net.py --ip 26.12.34.56 — слушать только в выбранной сети
+    python net.py --list           — показать доступные сети
 """
 
+import ipaddress
 import json
 import socket
 import threading
 import time
+from dataclasses import dataclass
 
 from core import MAX_HUMANS, TICK, World
 
@@ -30,9 +40,61 @@ PORT = 50505
 SNAPSHOT_INTERVAL = 1.0 / 30.0
 
 
-# Если игра показывает не тот адрес — впишите сюда свой адрес из Radmin VPN,
-# например MANUAL_ADDRESS = "26.12.34.56". Пустая строка = определять автоматически.
+# Нужно только если автоопределение «Все сети» показывает друзьям не тот адрес.
+# Пример: MANUAL_ADDRESS = "26.12.34.56". Пустая строка = определять автоматически.
+# (Если сеть выбирается в меню игры, эта настройка обычно не нужна.)
 MANUAL_ADDRESS = ""
+
+
+# =====================================================================
+#  СЕТЕВЫЕ ИНТЕРФЕЙСЫ
+# =====================================================================
+# вид -> (название, подсказка, приоритет в списке)
+KINDS = {
+    "radmin":    ("Radmin VPN",         "виртуальная сеть через интернет", 0),
+    "lan":       ("Локальная сеть",     "Wi-Fi / Ethernet — устройства на одном роутере", 1),
+    "hamachi":   ("Hamachi",            "виртуальная сеть через интернет", 2),
+    "zerotier":  ("ZeroTier",           "виртуальная сеть через интернет", 2),
+    "tailscale": ("Tailscale",          "виртуальная сеть через интернет", 2),
+    "vpn":       ("VPN",                "виртуальный адаптер VPN", 3),
+    "other":     ("Другая сеть",        "прочий адаптер", 5),
+    "virtual":   ("Виртуальный адаптер", "VirtualBox / WSL / Docker — обычно не нужен", 9),
+}
+
+_NAME_HINTS = (                       # подстрока имени адаптера -> вид
+    ("radmin", "radmin"), ("hamachi", "hamachi"), ("zerotier", "zerotier"),
+    ("tailscale", "tailscale"),
+    ("virtualbox", "virtual"), ("vmware", "virtual"), ("vethernet", "virtual"),
+    ("docker", "virtual"), ("wsl", "virtual"), ("hyper-v", "virtual"),
+    ("vboxnet", "virtual"), ("virbr", "virtual"), ("veth", "virtual"),
+    ("vpn", "vpn"), ("wireguard", "vpn"), ("tun", "vpn"),
+)
+
+
+@dataclass(frozen=True)
+class NetIface:
+    ip: str
+    kind: str
+    name: str = ""            # имя адаптера (если доступно psutil)
+
+    @property
+    def title(self) -> str:
+        return f"{KINDS[self.kind][0]}   {self.ip}"
+
+    @property
+    def desc(self) -> str:
+        parts = [p for p in (self.name, KINDS[self.kind][1]) if p]
+        return " · ".join(parts)
+
+
+@dataclass(frozen=True)
+class HostTarget:
+    """Один вариант в меню «в какой сети играем»."""
+    bind: str       # адрес для bind() сервера
+    connect: str    # куда подключается сам хост
+    show: str       # адрес, который показываем/копируем для друзей
+    title: str
+    desc: str = ""
 
 
 def _route_ip(target: str):
@@ -47,34 +109,93 @@ def _route_ip(target: str):
         return None
 
 
-def all_local_ips() -> list[str]:
-    ips: list[str] = []
+def _classify(ip: str, name: str):
+    """Вид сети по имени адаптера и адресу. None — адрес не годится (loopback и т.п.)."""
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ips.append(info[4][0])
-    except OSError:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    if (addr.version != 4 or addr.is_loopback or addr.is_link_local
+            or addr.is_unspecified or addr.is_multicast):
+        return None
+    low = name.lower()
+    for hint, kind in _NAME_HINTS:
+        if hint in low:
+            return kind
+    if ip.startswith("26."):
+        return "radmin"
+    if ip.startswith("25."):
+        return "hamachi"
+    if addr in ipaddress.ip_network("100.64.0.0/10"):
+        return "tailscale"
+    if addr.is_private:
+        return "lan"
+    return "other"
+
+
+def list_interfaces() -> list[NetIface]:
+    """Все подходящие IPv4-адреса этого компьютера, лучшие — первыми."""
+    found: dict[str, str] = {}        # ip -> имя адаптера
+
+    have_psutil = False
+    try:
+        import psutil                  # необязательная зависимость: даёт имена адаптеров
+        stats = psutil.net_if_stats()
+        for name, addrs in psutil.net_if_addrs().items():
+            st = stats.get(name)
+            if st is not None and not st.isup:
+                continue
+            for a in addrs:
+                if a.family == socket.AF_INET:
+                    found.setdefault(a.address, name)
+        have_psutil = True
+    except Exception:
         pass
-    for target in ("26.255.255.255", "10.255.255.255", "192.168.255.255"):
-        ip = _route_ip(target)
-        if ip:
-            ips.append(ip)
-    seen, result = set(), []
-    for ip in ips:
-        if ip not in seen and not ip.startswith("127."):
-            seen.add(ip)
-            result.append(ip)
+
+    if not have_psutil:
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                found.setdefault(info[4][0], "")
+        except OSError:
+            pass
+        for target in ("26.255.255.255", "10.255.255.255", "192.168.255.255",
+                       "172.16.255.255", "8.8.8.8"):
+            ip = _route_ip(target)
+            if ip:
+                found.setdefault(ip, "")
+
+    result = []
+    for ip, name in found.items():
+        kind = _classify(ip, name)
+        if kind:
+            result.append(NetIface(ip, kind, name))
+    result.sort(key=lambda i: KINDS[i.kind][2])      # сортировка устойчивая
     return result
 
 
+def all_local_ips() -> list[str]:
+    return [i.ip for i in list_interfaces()]
+
+
 def local_ip() -> str:
-    """Адрес для подключения друзей. Приоритет: ручной -> Radmin (26.*) -> обычный LAN."""
+    """Адрес для друзей, когда сеть не выбрана вручную: ручной -> лучший из списка."""
     if MANUAL_ADDRESS:
         return MANUAL_ADDRESS
-    ips = all_local_ips()
-    for ip in ips:
-        if ip.startswith("26."):          # Radmin VPN
-            return ip
-    return ips[0] if ips else "127.0.0.1"
+    ifaces = list_interfaces()
+    return ifaces[0].ip if ifaces else "127.0.0.1"
+
+
+def host_targets(limit: int = 5) -> list[HostTarget]:
+    """Варианты для меню выбора сети: найденные адаптеры + «все сети» + «только я»."""
+    targets = [HostTarget(i.ip, i.ip, i.ip, i.title, i.desc)
+               for i in list_interfaces()[:limit]]
+    best = local_ip()
+    targets.append(HostTarget("0.0.0.0", "127.0.0.1", best, "Все сети сразу",
+                              f"слушать на всех адаптерах · друзьям: {best}"))
+    targets.append(HostTarget("127.0.0.1", "127.0.0.1", "127.0.0.1",
+                              "Только этот компьютер",
+                              "для проверки: два окна игры на одном ПК"))
+    return targets
 
 
 def _encode(msg: dict) -> bytes:
@@ -85,8 +206,9 @@ def _encode(msg: dict) -> bytes:
 #  СЕРВЕР
 # =====================================================================
 class GameServer:
-    def __init__(self, port: int = PORT):
+    def __init__(self, port: int = PORT, host: str = "0.0.0.0"):
         self.port = port
+        self.host = host            # адрес адаптера, на котором слушаем
         self.world = World(spawn_extras=True)
         self.lock = threading.Lock()
         self.clients: dict[int, socket.socket] = {}
@@ -95,10 +217,14 @@ class GameServer:
 
     def start(self) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", self.port))
-        srv.listen(8)
-        srv.settimeout(0.5)
+        try:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((self.host, self.port))
+            srv.listen(8)
+            srv.settimeout(0.5)
+        except OSError:
+            srv.close()
+            raise
         self.srv = srv
         self.running = True
         threading.Thread(target=self._accept_loop, daemon=True).start()
@@ -352,9 +478,24 @@ class LocalSession:
 
 
 if __name__ == "__main__":
-    server = GameServer(PORT)
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Headless-сервер игры")
+    ap.add_argument("--ip", default="0.0.0.0",
+                    help="адрес сети, в которой слушать (по умолчанию все)")
+    ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--list", action="store_true", help="показать доступные сети и выйти")
+    args = ap.parse_args()
+
+    if args.list:
+        for i in list_interfaces():
+            print(f"{i.ip:<16} {i.title.split('   ')[0]:<22} {i.name}")
+        raise SystemExit(0)
+
+    server = GameServer(args.port, host=args.ip)
     server.start()
-    print(f"Сервер запущен: {local_ip()}:{PORT}  (Ctrl+C — остановить)")
+    shown = local_ip() if args.ip == "0.0.0.0" else args.ip
+    print(f"Сервер запущен: {shown}:{args.port}  (Ctrl+C — остановить)")
     try:
         while True:
             time.sleep(1.0)

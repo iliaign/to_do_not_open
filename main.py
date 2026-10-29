@@ -2,18 +2,25 @@
 Обучение в МФТИ — упоротая аркада с пинками (pygame + клиент/сервер).
 
 Запуск:  python main.py        (нужен pygame >= 2.0:  pip install pygame)
+Необязательно: pip install psutil — тогда в меню видны имена сетевых адаптеров.
 
 Режимы:
   * ИГРА С БОТОМ         — локально, против стоячего бота
-  * ОНЛАЙН / СОЗДАТЬ     — вы хост (сервер внутри процесса) + играете сами
-  * ОНЛАЙН / ПОДКЛЮЧИТЬСЯ — вводите IP хоста из локальной сети
+  * ОНЛАЙН / СОЗДАТЬ     — выбираете сеть (Radmin VPN, Wi-Fi, ...), вы хост
+                           (сервер внутри процесса) + играете сами;
+                           адрес копируется в буфер обмена автоматически
+  * ОНЛАЙН / ПОДКЛЮЧИТЬСЯ — вводите (или вставляете Ctrl+V) адрес хоста
 
-Управление: WASD / стрелки — двигаться, ПРОБЕЛ — пинок, ESC — в меню.
+Управление: WASD / стрелки — двигаться, ПРОБЕЛ — пинок, ESC — в меню,
+C (или клик по адресу) — скопировать адрес сервера (у хоста).
 """
 
 import functools
 import math
 import random
+import re
+import subprocess
+import sys
 from array import array
 
 import pygame
@@ -21,7 +28,7 @@ import pygame
 from core import (GROUND_MAX, GROUND_MIN, KICK_DURATION, OBJECT_SCALE, PERSON_X_LIMIT,
                   PLAYER_CONTROL_SPEED, SPEED_SCALE, WALL_X, X_MAX, X_MIN,
                   Y_MAX, Y_MIN, clamp)
-from net import PORT, GameServer, LocalSession, NetSession, local_ip
+from net import PORT, GameServer, HostTarget, LocalSession, NetSession, host_targets
 
 # =====================================================================
 #  ОБЩЕЕ
@@ -38,6 +45,8 @@ C_DIM = (148, 163, 184)
 C_GOLD = (251, 191, 36)
 C_CYAN = (34, 211, 238)
 C_YELLOW = (250, 204, 21)
+C_OK = (74, 222, 128)
+C_ERR = (252, 165, 165)
 
 QUIT = "__quit__"
 
@@ -60,6 +69,99 @@ def draw_text(surf, text, size, color, pos, anchor="center", bold=False):
 def to_screen(x: float, y: float) -> tuple[int, int]:
     return (int(round(GAME_RECT.left + (x - X_MIN) * SCALE)),
             int(round(GAME_RECT.top + (Y_MAX - y) * SCALE)))
+
+
+# =====================================================================
+#  БУФЕР ОБМЕНА
+# =====================================================================
+def _run(cmd, data=None, want_output=False, timeout=3.0):
+    flags = 0x08000000 if sys.platform == "win32" else 0     # CREATE_NO_WINDOW
+    return subprocess.run(
+        cmd, input=data, timeout=timeout, creationflags=flags,
+        stdout=subprocess.PIPE if want_output else subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL)
+
+
+def _clip_cmds(write: bool):
+    if sys.platform == "win32":
+        return [["clip"]] if write else [["powershell", "-NoProfile", "-Command",
+                                          "Get-Clipboard"]]
+    if sys.platform == "darwin":
+        return [["pbcopy"]] if write else [["pbpaste"]]
+    if write:
+        return [["wl-copy"], ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"]]
+    return [["wl-paste", "-n"], ["xclip", "-selection", "clipboard", "-o"],
+            ["xsel", "--clipboard", "--output"]]
+
+
+def copy_text(text: str) -> bool:
+    """Кладёт текст в буфер обмена. True — получилось."""
+    try:                                              # 1) pygame (SDL)
+        if not pygame.scrap.get_init():
+            pygame.scrap.init()
+        pygame.scrap.put_text(text)
+        return True
+    except Exception:
+        pass
+    for cmd in _clip_cmds(write=True):                # 2) системная утилита
+        try:
+            if _run(cmd, data=text.encode("utf-8")).returncode == 0:
+                return True
+        except Exception:
+            continue
+    try:                                              # 3) tkinter
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        root.update()
+        root.destroy()
+        return True
+    except Exception:
+        return False
+
+
+def paste_text() -> str:
+    """Первая строка из буфера обмена ('' если пусто или недоступно)."""
+    raw = ""
+    try:
+        if not pygame.scrap.get_init():
+            pygame.scrap.init()
+        raw = pygame.scrap.get_text()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "ignore")
+    except Exception:
+        raw = ""
+    if not raw:
+        for cmd in _clip_cmds(write=False):
+            try:
+                res = _run(cmd, want_output=True)
+                if res.returncode == 0 and res.stdout:
+                    raw = res.stdout.decode("utf-8", "ignore")
+                    break
+            except Exception:
+                continue
+    if not raw:
+        try:
+            import tkinter
+            root = tkinter.Tk()
+            root.withdraw()
+            raw = root.clipboard_get()
+            root.destroy()
+        except Exception:
+            raw = ""
+    lines = raw.replace("\x00", "").strip().splitlines()
+    return lines[0].strip() if lines else ""
+
+
+ADDR_ALLOWED = set("0123456789.:abcdefghijklmnopqrstuvwxyz-")
+_ADDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}(:\d{1,5})?$")
+
+
+def clean_address(raw: str) -> str:
+    return "".join(c for c in raw.lower() if c in ADDR_ALLOWED)
 
 
 # =====================================================================
@@ -292,7 +394,13 @@ def draw_person(surf, pr: dict, t: float) -> None:
                                 [(bx - 6, by - 26), (bx + 6, by - 26), (bx, by - 15)])
 
 
-def draw_sidebar(screen, base, my_id, mode_lines, server_addr=None) -> None:
+def addr_box_rect() -> pygame.Rect:
+    """Рамка с адресом сервера в боковой панели (она же кнопка «копировать»)."""
+    top = int(SIDE_RECT.top + (1 - 0.24) * SIDE_RECT.height)
+    return pygame.Rect(SIDE_RECT.left + 14, top, SIDE_RECT.width - 28, 92)
+
+
+def draw_sidebar(screen, base, my_id, mode_lines, server_addr=None, copy_state=None) -> None:
     pygame.draw.rect(screen, C_PANEL, SIDE_RECT)
     cx = SIDE_RECT.centerx
 
@@ -340,15 +448,25 @@ def draw_sidebar(screen, base, my_id, mode_lines, server_addr=None) -> None:
     if npc:
         draw_text(screen, f"+ NPC: {npc}", 14, C_DIM, (SIDE_RECT.left + 20, y), "midleft")
 
-    # --- адрес сервера (когда мы хост)
+    # --- адрес сервера (когда мы хост); клик по рамке — копировать
     if server_addr:
-        box = pygame.Rect(SIDE_RECT.left + 14, int(sy(0.24)), SIDE_RECT.width - 28, 92)
-        pygame.draw.rect(screen, (15, 23, 42), box, border_radius=8)
-        pygame.draw.rect(screen, C_CYAN, box, 2, border_radius=8)
+        box = addr_box_rect()
+        hover = box.collidepoint(pygame.mouse.get_pos())
+        border = {"ok": C_OK, "fail": C_ERR}.get(copy_state, C_CYAN)
+        pygame.draw.rect(screen, (22, 33, 56) if hover else (15, 23, 42), box,
+                         border_radius=8)
+        pygame.draw.rect(screen, border, box, 2, border_radius=8)
         draw_text(screen, "АДРЕС СЕРВЕРА", 15, C_DIM, (cx, box.top + 8), "midtop", True)
         draw_text(screen, server_addr, 22, C_CYAN, (cx, box.top + 32), "midtop", True)
-        draw_text(screen, "друзья вводят его в «Подключиться»", 12, C_DIM,
-                  (cx, box.top + 66), "midtop")
+        if copy_state == "ok":
+            draw_text(screen, "СКОПИРОВАНО В БУФЕР!", 14, C_OK, (cx, box.top + 66),
+                      "midtop", True)
+        elif copy_state == "fail":
+            draw_text(screen, "не удалось скопировать", 13, C_ERR, (cx, box.top + 66),
+                      "midtop")
+        else:
+            draw_text(screen, "нажми сюда или C — скопировать", 12, C_DIM,
+                      (cx, box.top + 66), "midtop")
 
     for i, line in enumerate(reversed(mode_lines)):
         draw_text(screen, line, 14, (100, 116, 139),
@@ -367,6 +485,7 @@ KEY_ACTIONS = {
     -pygame.K_a: "left", -pygame.K_LEFT: "left", -pygame.K_d: "right",
     -pygame.K_RIGHT: "right", -pygame.K_SPACE: "kick",
 }
+SC_C, SC_V = 6, 25                    # физические коды клавиш C и V
 
 
 def key_id(ev) -> int:
@@ -386,10 +505,24 @@ def play(screen, clock, sfx, session, mode_lines, obj_surf, server_addr=None) ->
     local = None                      # предсказанная позиция своего игрока
     focus_lost = getattr(pygame, "WINDOWFOCUSLOST", None)
 
+    copy_state = None                 # None | "ok" | "fail" — подпись в рамке адреса
+    copy_until = 0.0
+
+    def do_copy():
+        nonlocal copy_state, copy_until
+        copy_state = "ok" if copy_text(server_addr) else "fail"
+        copy_until = pygame.time.get_ticks() / 1000.0 + 3.0
+
+    if server_addr:
+        do_copy()                     # хост: адрес сразу попадает в буфер обмена
+
     while True:
         dt = min(clock.tick(60) / 1000.0, 0.1)
         anim_t += dt * SPEED_SCALE
         kick = False
+
+        if copy_state and pygame.time.get_ticks() / 1000.0 > copy_until:
+            copy_state = None
 
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
@@ -397,12 +530,19 @@ def play(screen, clock, sfx, session, mode_lines, obj_surf, server_addr=None) ->
             if ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_ESCAPE:
                     return ""
+                if server_addr and (ev.key == pygame.K_c
+                                    or getattr(ev, "scancode", None) == SC_C):
+                    do_copy()
+                    continue
                 kid = key_id(ev)
                 held.add(kid)
                 if KEY_ACTIONS.get(kid) == "kick":
                     kick = True
             elif ev.type == pygame.KEYUP:
                 held.discard(key_id(ev))
+            elif (ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1
+                  and server_addr and addr_box_rect().collidepoint(ev.pos)):
+                do_copy()
             elif focus_lost is not None and ev.type == focus_lost:
                 held.clear()
 
@@ -430,7 +570,7 @@ def play(screen, clock, sfx, session, mode_lines, obj_surf, server_addr=None) ->
         if base is None:
             draw_text(screen, "Ожидание данных от сервера...", 22, C_DIM,
                       GAME_RECT.center)
-            draw_sidebar(screen, None, session.my_id, mode_lines, server_addr)
+            draw_sidebar(screen, None, session.my_id, mode_lines, server_addr, copy_state)
             pygame.display.flip()
             continue
 
@@ -482,7 +622,7 @@ def play(screen, clock, sfx, session, mode_lines, obj_surf, server_addr=None) ->
         draw_text(screen, "WASD / стрелки — двигаться     ПРОБЕЛ — пинок     ESC — меню",
                   15, C_DIM, (GAME_RECT.centerx, to_screen(0, -6.7)[1]), "center")
 
-        draw_sidebar(screen, base, session.my_id, mode_lines, server_addr)
+        draw_sidebar(screen, base, session.my_id, mode_lines, server_addr, copy_state)
         pygame.display.flip()
 
 
@@ -490,20 +630,30 @@ def play(screen, clock, sfx, session, mode_lines, obj_surf, server_addr=None) ->
 #  МЕНЮ
 # =====================================================================
 class Button:
-    def __init__(self, key, text, center, color, hover, w=420, h=60):
+    def __init__(self, key, text, center, color, hover, w=420, h=60, sub=""):
         self.key, self.text, self.color, self.hover = key, text, color, hover
+        self.sub = sub
         self.rect = pygame.Rect(0, 0, w, h)
         self.rect.center = center
 
     def draw(self, screen, mouse):
         col = self.hover if self.rect.collidepoint(mouse) else self.color
         pygame.draw.rect(screen, col, self.rect, border_radius=8)
-        draw_text(screen, self.text, 22, C_BG, self.rect.center, "center", True)
+        if self.sub:
+            sub = self.sub if len(self.sub) <= 72 else self.sub[:69] + "..."
+            draw_text(screen, self.text, 20, C_BG,
+                      (self.rect.centerx, self.rect.top + 17), "center", True)
+            draw_text(screen, sub, 13, (30, 41, 59),
+                      (self.rect.centerx, self.rect.top + 38), "center")
+        else:
+            draw_text(screen, self.text, 22, C_BG, self.rect.center, "center", True)
 
 
 GREEN, GREEN_H = (34, 197, 94), (22, 163, 74)
 BLUE, BLUE_H = (96, 165, 250), (59, 130, 246)
 RED, RED_H = (239, 68, 68), (220, 38, 38)
+AMBER, AMBER_H = (251, 191, 36), (245, 158, 11)
+GRAY, GRAY_H = (203, 213, 225), (148, 163, 184)
 
 
 def draw_title(screen, subtitle):
@@ -528,7 +678,7 @@ def choose(screen, clock, subtitle, buttons, notice="", esc_key=None):
         for b in buttons:
             b.draw(screen, mouse)
         if notice:
-            draw_text(screen, notice, 18, (252, 165, 165), (WIN_W // 2, WIN_H - 60))
+            draw_text(screen, notice, 18, C_ERR, (WIN_W // 2, WIN_H - 60))
         pygame.display.flip()
         clock.tick(60)
 
@@ -551,13 +701,57 @@ def online_menu(screen, clock):
     ], esc_key="back")
 
 
+def network_menu(screen, clock):
+    """Выбор сети, в которой хост создаёт игру.
+
+    Возвращает HostTarget, None (назад) или QUIT.
+    """
+    cx = WIN_W // 2
+    while True:
+        targets = host_targets()
+        real = len(targets) - 2                    # без «Все сети» и «Только этот компьютер»
+        buttons = []
+        y = 225
+        for i, t in enumerate(targets):
+            if t.bind == "0.0.0.0":
+                col, hov = AMBER, AMBER_H
+            elif t.bind == "127.0.0.1":
+                col, hov = GRAY, GRAY_H
+            elif i == 0:
+                col, hov = GREEN, GREEN_H
+            else:
+                col, hov = BLUE, BLUE_H
+            buttons.append(Button(i, t.title, (cx, y), col, hov, w=660, h=50, sub=t.desc))
+            y += 58
+        buttons.append(Button("refresh", "ОБНОВИТЬ", (cx - 165, 655), GRAY, GRAY_H,
+                              w=320, h=50))
+        buttons.append(Button("back", "НАЗАД", (cx + 165, 655), RED, RED_H, w=320, h=50))
+
+        subtitle = ("выберите сеть, в которой будете играть" if real > 0 else
+                    "сети не найдены — подключитесь к Wi-Fi / Radmin и нажмите ОБНОВИТЬ")
+        res = choose(screen, clock, subtitle, buttons, esc_key="back")
+        if res == QUIT:
+            return QUIT
+        if res == "back":
+            return None
+        if res == "refresh":
+            continue
+        return targets[res]
+
+
 def join_menu(screen, clock, text=""):
     """Ввод IP. Возвращает NetSession, None (назад) или QUIT."""
     cx = WIN_W // 2
     error = ""
     btn_join = Button("join", "ПОДКЛЮЧИТЬСЯ", (cx, 430), GREEN, GREEN_H)
     btn_back = Button("back", "НАЗАД", (cx, 510), RED, RED_H)
-    allowed = set("0123456789.:abcdefghijklmnopqrstuvwxyz-")
+    btn_paste = Button("paste", "ВСТАВИТЬ", (cx + 380, 330), BLUE, BLUE_H, w=170, h=56)
+
+    # если в буфере уже лежит адрес (хост прислал) — подставляем сразу
+    if not text:
+        clip = paste_text()
+        if _ADDR_RE.match(clip):
+            text = clip
 
     def attempt():
         nonlocal error
@@ -576,6 +770,14 @@ def join_menu(screen, clock, text=""):
             error = f"Не удалось подключиться: {e}"
             return None
 
+    def paste():
+        nonlocal text, error
+        clip = clean_address(paste_text())
+        if clip:
+            text, error = clip, ""
+        else:
+            error = "В буфере обмена нет адреса"
+
     pygame.key.start_text_input()
     try:
         while True:
@@ -584,11 +786,15 @@ def join_menu(screen, clock, text=""):
                 if ev.type == pygame.QUIT:
                     return QUIT
                 if ev.type == pygame.TEXTINPUT:
-                    text += "".join(c for c in ev.text.lower() if c in allowed)
+                    text += clean_address(ev.text)
                 elif ev.type == pygame.KEYDOWN:
+                    ctrl = ev.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)
                     if ev.key == pygame.K_ESCAPE:
                         return None
-                    if ev.key == pygame.K_BACKSPACE:
+                    if ctrl and (ev.key == pygame.K_v
+                                 or getattr(ev, "scancode", None) == SC_V):
+                        paste()
+                    elif ev.key == pygame.K_BACKSPACE:
                         text = text[:-1]
                     elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         s = attempt()
@@ -597,14 +803,16 @@ def join_menu(screen, clock, text=""):
                 elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                     if btn_back.rect.collidepoint(ev.pos):
                         return None
-                    if btn_join.rect.collidepoint(ev.pos):
+                    if btn_paste.rect.collidepoint(ev.pos):
+                        paste()
+                    elif btn_join.rect.collidepoint(ev.pos):
                         s = attempt()
                         if s:
                             return s
 
             draw_title(screen, "подключение по IP")
-            draw_text(screen, f"Введите адрес хоста (порт по умолчанию {PORT})", 18,
-                      C_DIM, (cx, 270))
+            draw_text(screen, f"Введите адрес хоста или вставьте Ctrl+V "
+                              f"(порт по умолчанию {PORT})", 18, C_DIM, (cx, 270))
             box = pygame.Rect(0, 0, 560, 56)
             box.center = (cx, 330)
             pygame.draw.rect(screen, C_PANEL, box, border_radius=6)
@@ -613,13 +821,68 @@ def join_menu(screen, clock, text=""):
             draw_text(screen, text + caret, 26, C_TEXT, (box.left + 14, box.centery),
                       "midleft")
             if error:
-                draw_text(screen, error, 17, (252, 165, 165), (cx, 385))
+                draw_text(screen, error, 17, C_ERR, (cx, 385))
+            btn_paste.draw(screen, mouse)
             btn_join.draw(screen, mouse)
             btn_back.draw(screen, mouse)
             pygame.display.flip()
             clock.tick(60)
     finally:
         pygame.key.stop_text_input()
+
+
+# =====================================================================
+#  ОНЛАЙН
+# =====================================================================
+def host_game(screen, clock, sfx, obj_surf, target: HostTarget) -> str:
+    """Создаёт сервер в выбранной сети и играет. Возвращает "", QUIT или уведомление."""
+    server = GameServer(PORT, host=target.bind)
+    try:
+        server.start()
+        session = NetSession(target.connect, PORT)
+    except Exception as e:
+        server.stop()
+        return f"Не удалось создать игру в сети {target.show}: {e}"
+    addr = f"{target.show}:{PORT}"
+    net_name = target.title.split("   ")[0]
+    print(f"Сервер запущен ({net_name}). Адрес для подключения: {addr}")
+    try:
+        return play(screen, clock, sfx, session,
+                    ["режим: онлайн (хост)", f"сеть: {net_name}"],
+                    obj_surf, server_addr=addr)
+    finally:
+        session.close()
+        server.stop()
+
+
+def run_online(screen, clock, sfx, obj_surf) -> str:
+    """Весь онлайн-раздел: меню -> выбор сети / ввод адреса -> игра."""
+    while True:
+        sub = online_menu(screen, clock)
+        if sub == QUIT:
+            return QUIT
+        if sub == "back":
+            return ""
+
+        if sub == "host":
+            target = network_menu(screen, clock)
+            if target == QUIT:
+                return QUIT
+            if target is None:
+                continue
+            return host_game(screen, clock, sfx, obj_surf, target)
+
+        if sub == "join":
+            session = join_menu(screen, clock)
+            if session == QUIT:
+                return QUIT
+            if session is None:
+                continue
+            try:
+                return play(screen, clock, sfx, session,
+                            ["режим: онлайн (клиент)"], obj_surf)
+            finally:
+                session.close()
 
 
 # =====================================================================
@@ -647,34 +910,8 @@ def main() -> None:
             result = play(screen, clock, sfx, session,
                           ["режим: игра с ботом"], obj_surf)
             session.close()
-
         elif choice == "online":
-            sub = online_menu(screen, clock)
-            if sub == QUIT:
-                break
-            if sub == "host":
-                server = GameServer(PORT)
-                try:
-                    server.start()
-                    session = NetSession("127.0.0.1", PORT)
-                except Exception as e:
-                    server.stop()
-                    notice = f"Не удалось создать игру: {e}"
-                    continue
-                addr = f"{local_ip()}:{PORT}"
-                print(f"Сервер запущен. Адрес для подключения: {addr}")
-                result = play(screen, clock, sfx, session,
-                              ["режим: онлайн (хост)"], obj_surf, server_addr=addr)
-                session.close()
-                server.stop()
-            elif sub == "join":
-                session = join_menu(screen, clock)
-                if session == QUIT:
-                    break
-                if session is not None:
-                    result = play(screen, clock, sfx, session,
-                                  ["режим: онлайн (клиент)"], obj_surf)
-                    session.close()
+            result = run_online(screen, clock, sfx, obj_surf)
 
         if result == QUIT:
             break

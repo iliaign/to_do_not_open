@@ -1,25 +1,24 @@
 """
 net.py — сеть и «сессии».
 
-Протокол: TCP, JSON-строки (по одной на сообщение, разделитель '\n').
+Протокол v2: TCP, JSON-строки (по одной на сообщение, разделитель '\n').
 
-  клиент -> сервер:  {"t":"in","mx":-1|0|1,"my":-1|0|1,"k":true|false}
-  сервер -> клиент:  {"t":"welcome","id":N}
-                     {"t":"full"}
-                     {"t":"s", ...снимок World.snapshot()...}   ~30 раз/сек
+  клиент -> сервер:  {"t":"hello","v":2,"name":"Илья"}                    первым сообщением
+                     {"t":"in","mx":-1|0|1,"my":-1|0|1,"k":bool,"ox":x,"oy":y}
+                         ox/oy — где игрок видел объект в момент пинка (компенсация задержки)
+  сервер -> клиент:  {"t":"welcome","v":2,"id":N,"name":"..."}
+                     {"t":"bad_version","v":2}   |   {"t":"full"}
+                     {"t":"roster","rv":N,"p":[[pid,color,kind,name],...]}  при изменениях
+                     {"t":"s", ...снимок World.snapshot()...}               ~30 раз/сек
 
 Сервер авторитетный: симуляция идёт только на нём, клиенты шлют ввод
-и рисуют снимки.
+и рисуют снимки. У каждого клиента своя очередь и поток отправки: медленное
+соединение одного игрока не тормозит остальных (старые снимки просто отбрасываются).
 
-Сессии имеют одинаковый интерфейс (его использует main.py):
-    my_id, alive, predict, send_input(mx,my,kick), poll() -> (snapshot|None, events), close()
+Сессии имеют одинаковый интерфейс (его использует game.py):
+    my_id, alive, predict, roster, send_input(mx,my,kick,claim), poll() -> (snapshot|None, events), close()
   * NetSession   — подключение к серверу по сети
   * LocalSession — локальный World в том же процессе (игра с ботом)
-
-Выбор сети для хоста:
-  * list_interfaces() — все IPv4-адреса компьютера (Radmin VPN, Wi-Fi/Ethernet, ...)
-  * host_targets()    — готовые варианты для меню «в какой сети играем»
-  * GameServer(port, host=IP) слушает только на выбранном адаптере
 
 Отдельный headless-сервер:
     python net.py                  — слушать на всех сетях
@@ -27,175 +26,24 @@ net.py — сеть и «сессии».
     python net.py --list           — показать доступные сети
 """
 
-import ipaddress
+from __future__ import annotations
+
+import errno
 import json
+import math
 import socket
 import threading
 import time
-from dataclasses import dataclass
 
-from core import MAX_HUMANS, TICK, World
+from core import MAX_HUMANS, TICK, World, sanitize_name
+from discovery import Announcer
+from netutil import (DISCOVERY_PORT, PORT, HostTarget, NetIface,  # noqa: F401  (реэкспорт)
+                     friendly_error, host_targets, list_interfaces, local_ip)
 
-PORT = 50505
-SNAPSHOT_INTERVAL = 1.0 / 30.0
-
-
-# Нужно только если автоопределение «Все сети» показывает друзьям не тот адрес.
-# Пример: MANUAL_ADDRESS = "26.12.34.56". Пустая строка = определять автоматически.
-# (Если сеть выбирается в меню игры, эта настройка обычно не нужна.)
-MANUAL_ADDRESS = ""
-
-
-# =====================================================================
-#  СЕТЕВЫЕ ИНТЕРФЕЙСЫ
-# =====================================================================
-# вид -> (название, подсказка, приоритет в списке)
-KINDS = {
-    "radmin":    ("Radmin VPN",         "виртуальная сеть через интернет", 0),
-    "lan":       ("Локальная сеть",     "Wi-Fi / Ethernet — устройства на одном роутере", 1),
-    "hamachi":   ("Hamachi",            "виртуальная сеть через интернет", 2),
-    "zerotier":  ("ZeroTier",           "виртуальная сеть через интернет", 2),
-    "tailscale": ("Tailscale",          "виртуальная сеть через интернет", 2),
-    "vpn":       ("VPN",                "виртуальный адаптер VPN", 3),
-    "other":     ("Другая сеть",        "прочий адаптер", 5),
-    "virtual":   ("Виртуальный адаптер", "VirtualBox / WSL / Docker — обычно не нужен", 9),
-}
-
-_NAME_HINTS = (                       # подстрока имени адаптера -> вид
-    ("radmin", "radmin"), ("hamachi", "hamachi"), ("zerotier", "zerotier"),
-    ("tailscale", "tailscale"),
-    ("virtualbox", "virtual"), ("vmware", "virtual"), ("vethernet", "virtual"),
-    ("docker", "virtual"), ("wsl", "virtual"), ("hyper-v", "virtual"),
-    ("vboxnet", "virtual"), ("virbr", "virtual"), ("veth", "virtual"),
-    ("vpn", "vpn"), ("wireguard", "vpn"), ("tun", "vpn"),
-)
-
-
-@dataclass(frozen=True)
-class NetIface:
-    ip: str
-    kind: str
-    name: str = ""            # имя адаптера (если доступно psutil)
-
-    @property
-    def title(self) -> str:
-        return f"{KINDS[self.kind][0]}   {self.ip}"
-
-    @property
-    def desc(self) -> str:
-        parts = [p for p in (self.name, KINDS[self.kind][1]) if p]
-        return " · ".join(parts)
-
-
-@dataclass(frozen=True)
-class HostTarget:
-    """Один вариант в меню «в какой сети играем»."""
-    bind: str       # адрес для bind() сервера
-    connect: str    # куда подключается сам хост
-    show: str       # адрес, который показываем/копируем для друзей
-    title: str
-    desc: str = ""
-
-
-def _route_ip(target: str):
-    """IP нашего интерфейса, через который идёт маршрут к target (пакеты не отправляются)."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect((target, 1))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except OSError:
-        return None
-
-
-def _classify(ip: str, name: str):
-    """Вид сети по имени адаптера и адресу. None — адрес не годится (loopback и т.п.)."""
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return None
-    if (addr.version != 4 or addr.is_loopback or addr.is_link_local
-            or addr.is_unspecified or addr.is_multicast):
-        return None
-    low = name.lower()
-    for hint, kind in _NAME_HINTS:
-        if hint in low:
-            return kind
-    if ip.startswith("26."):
-        return "radmin"
-    if ip.startswith("25."):
-        return "hamachi"
-    if addr in ipaddress.ip_network("100.64.0.0/10"):
-        return "tailscale"
-    if addr.is_private:
-        return "lan"
-    return "other"
-
-
-def list_interfaces() -> list[NetIface]:
-    """Все подходящие IPv4-адреса этого компьютера, лучшие — первыми."""
-    found: dict[str, str] = {}        # ip -> имя адаптера
-
-    have_psutil = False
-    try:
-        import psutil                  # необязательная зависимость: даёт имена адаптеров
-        stats = psutil.net_if_stats()
-        for name, addrs in psutil.net_if_addrs().items():
-            st = stats.get(name)
-            if st is not None and not st.isup:
-                continue
-            for a in addrs:
-                if a.family == socket.AF_INET:
-                    found.setdefault(a.address, name)
-        have_psutil = True
-    except Exception:
-        pass
-
-    if not have_psutil:
-        try:
-            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-                found.setdefault(info[4][0], "")
-        except OSError:
-            pass
-        for target in ("26.255.255.255", "10.255.255.255", "192.168.255.255",
-                       "172.16.255.255", "8.8.8.8"):
-            ip = _route_ip(target)
-            if ip:
-                found.setdefault(ip, "")
-
-    result = []
-    for ip, name in found.items():
-        kind = _classify(ip, name)
-        if kind:
-            result.append(NetIface(ip, kind, name))
-    result.sort(key=lambda i: KINDS[i.kind][2])      # сортировка устойчивая
-    return result
-
-
-def all_local_ips() -> list[str]:
-    return [i.ip for i in list_interfaces()]
-
-
-def local_ip() -> str:
-    """Адрес для друзей, когда сеть не выбрана вручную: ручной -> лучший из списка."""
-    if MANUAL_ADDRESS:
-        return MANUAL_ADDRESS
-    ifaces = list_interfaces()
-    return ifaces[0].ip if ifaces else "127.0.0.1"
-
-
-def host_targets(limit: int = 5) -> list[HostTarget]:
-    """Варианты для меню выбора сети: найденные адаптеры + «все сети» + «только я»."""
-    targets = [HostTarget(i.ip, i.ip, i.ip, i.title, i.desc)
-               for i in list_interfaces()[:limit]]
-    best = local_ip()
-    targets.append(HostTarget("0.0.0.0", "127.0.0.1", best, "Все сети сразу",
-                              f"слушать на всех адаптерах · друзьям: {best}"))
-    targets.append(HostTarget("127.0.0.1", "127.0.0.1", "127.0.0.1",
-                              "Только этот компьютер",
-                              "для проверки: два окна игры на одном ПК"))
-    return targets
+PROTOCOL = 2
+SNAPSHOT_STEPS = 2           # снимок каждые 2 тика = 30 раз/сек при 60 тиках
+HELLO_TIMEOUT = 3.0          # сколько ждём приветствие от нового клиента
+SILENCE_TIMEOUT = 8.0        # клиент считает соединение потерянным после такой тишины
 
 
 def _encode(msg: dict) -> bytes:
@@ -205,41 +53,117 @@ def _encode(msg: dict) -> bytes:
 # =====================================================================
 #  СЕРВЕР
 # =====================================================================
+class _Client:
+    """Один подключённый игрок со своим потоком отправки."""
+
+    def __init__(self, server: "GameServer", pid: int, conn: socket.socket):
+        self.server, self.pid, self.conn = server, pid, conn
+        self.cv = threading.Condition()
+        self._ctrl: list[bytes] = []
+        self._snap = None
+        self.alive = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def send_ctrl(self, data: bytes) -> None:
+        with self.cv:
+            self._ctrl.append(data)
+            self.cv.notify()
+
+    def send_snapshot(self, snap: dict) -> None:
+        with self.cv:
+            if self._snap is not None:               # прошлый снимок так и не ушёл:
+                old_ev = self._snap["ev"]            # выкидываем его, но события (звуки) сохраняем
+                if old_ev:
+                    snap = dict(snap)
+                    snap["ev"] = old_ev + snap["ev"]
+            self._snap = snap
+            self.cv.notify()
+
+    def close(self) -> None:
+        with self.cv:
+            self.alive = False
+            self.cv.notify()
+        try:
+            self.conn.close()
+        except OSError:
+            pass
+
+    def _run(self) -> None:
+        while True:
+            with self.cv:
+                while self.alive and not self._ctrl and self._snap is None:
+                    self.cv.wait(0.5)
+                if not self.alive:
+                    return
+                ctrl, self._ctrl = self._ctrl, []
+                snap, self._snap = self._snap, None
+            try:
+                for data in ctrl:
+                    self.conn.sendall(data)
+                if snap is not None:
+                    self.conn.sendall(_encode(snap))
+            except OSError:
+                break
+        self.server._drop(self.pid)
+
+
 class GameServer:
-    def __init__(self, port: int = PORT, host: str = "0.0.0.0"):
+    def __init__(self, port: int = PORT, host: str = "0.0.0.0", name: str = ""):
         self.port = port
-        self.host = host            # адрес адаптера, на котором слушаем
+        self.host = host                       # адрес адаптера, на котором слушаем
+        self.name = sanitize_name(name) or "Игра"
         self.world = World(spawn_extras=True)
         self.lock = threading.Lock()
-        self.clients: dict[int, socket.socket] = {}
+        self.clients: dict[int, _Client] = {}
         self.running = False
         self.srv = None
+        self._announcer = None
+
+    def player_info(self) -> tuple[int, int]:
+        return len(self.clients), MAX_HUMANS
 
     def start(self) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind((self.host, self.port))
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                # Windows: SO_REUSEADDR разрешил бы двум хостам занять один порт
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            for attempt in range(6):
+                try:
+                    srv.bind((self.host, self.port))
+                    break
+                except OSError as e:
+                    busy = e.errno in (errno.EADDRINUSE, 10048)
+                    if busy and attempt < 5:
+                        time.sleep(0.25)             # порт мог ещё не освободиться после прошлой игры
+                        continue
+                    if busy:
+                        raise OSError(f"порт {self.port} занят — игра уже запущена?") from e
+                    raise
             srv.listen(8)
             srv.settimeout(0.5)
         except OSError:
             srv.close()
             raise
+        self.port = srv.getsockname()[1]
         self.srv = srv
         self.running = True
         threading.Thread(target=self._accept_loop, daemon=True).start()
         threading.Thread(target=self._tick_loop, daemon=True).start()
+        self._announcer = Announcer(self.host, self.port, self.name, self.player_info, PROTOCOL)
+        self._announcer.start()
 
     def stop(self) -> None:
         self.running = False
+        if self._announcer:
+            self._announcer.stop()
         with self.lock:
-            conns = list(self.clients.values())
+            clients = list(self.clients.values())
             self.clients.clear()
-        for c in conns:
-            try:
-                c.close()
-            except OSError:
-                pass
+        for c in clients:
+            c.close()
         if self.srv:
             try:
                 self.srv.close()
@@ -255,33 +179,95 @@ class GameServer:
                 continue
             except OSError:
                 break
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            conn.settimeout(2.0)
-            with self.lock:
-                person = self.world.add_human() if len(self.clients) < MAX_HUMANS else None
-                pid = person.pid if person else None
-            if pid is None:
-                try:
-                    conn.sendall(_encode({"t": "full"}))
-                except OSError:
-                    pass
-                conn.close()
-                continue
-            try:
-                conn.sendall(_encode({"t": "welcome", "id": pid}))
-            except OSError:
-                with self.lock:
-                    self.world.remove(pid)
-                conn.close()
-                continue
-            with self.lock:
-                self.clients[pid] = conn
-            threading.Thread(target=self._client_loop, args=(pid, conn),
-                             daemon=True).start()
+            threading.Thread(target=self._handshake, args=(conn,), daemon=True).start()
 
-    def _client_loop(self, pid: int, conn: socket.socket) -> None:
+    @staticmethod
+    def _reject(conn: socket.socket, msg: dict) -> None:
+        try:
+            conn.sendall(_encode(msg))
+        except OSError:
+            pass
+        conn.close()
+
+    def _read_hello(self, conn: socket.socket):
         buf = b""
+        while b"\n" not in buf:
+            data = conn.recv(1024)
+            if not data:
+                raise ValueError("соединение закрыто")
+            buf += data
+            if len(buf) > 4096:
+                raise ValueError("слишком длинное приветствие")
+        line, rest = buf.split(b"\n", 1)
+        msg = json.loads(line)
+        if not isinstance(msg, dict) or msg.get("t") != "hello":
+            raise ValueError("ожидалось hello")
+        return msg, rest
+
+    def _roster_msg(self) -> dict:                  # вызывать под self.lock
+        return {"t": "roster", "rv": self.world.roster_version, "p": self.world.roster()}
+
+    def _handshake(self, conn: socket.socket) -> None:
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.settimeout(HELLO_TIMEOUT)
+            msg, rest = self._read_hello(conn)
+        except (OSError, ValueError):
+            conn.close()
+            return
+        if msg.get("v") != PROTOCOL:
+            self._reject(conn, {"t": "bad_version", "v": PROTOCOL})
+            return
+        with self.lock:
+            person = self.world.add_human(msg.get("name", "")) if self.running else None
+            pid = person.pid if person else None
+            pname = person.name if person else ""
+        if pid is None:
+            self._reject(conn, {"t": "full"})
+            return
+        try:
+            conn.sendall(_encode({"t": "welcome", "v": PROTOCOL, "id": pid, "name": pname}))
+        except OSError:
+            with self.lock:
+                self.world.remove(pid)
+            conn.close()
+            return
+        conn.settimeout(2.0)
+        client = _Client(self, pid, conn)
+        with self.lock:
+            self.clients[pid] = client
+            client.send_ctrl(_encode(self._roster_msg()))   # новичок сразу получает состав
+        threading.Thread(target=self._client_loop, args=(pid, conn, rest),
+                         daemon=True).start()
+
+    def _handle_msg(self, pid: int, line: bytes) -> None:
+        try:
+            msg = json.loads(line)
+            if msg.get("t") != "in":
+                return
+            mx = int(msg.get("mx", 0))
+            my = int(msg.get("my", 0))
+            kick = bool(msg.get("k"))
+            claim = None
+            if kick:
+                try:
+                    cx, cy = float(msg["ox"]), float(msg["oy"])
+                    if math.isfinite(cx) and math.isfinite(cy):
+                        claim = (cx, cy)
+                except (KeyError, TypeError, ValueError):
+                    claim = None
+            with self.lock:
+                self.world.set_input(pid, mx, my)
+                if kick:
+                    self.world.queue_kick(pid, claim)
+        except (ValueError, TypeError, AttributeError):
+            return
+
+    def _client_loop(self, pid: int, conn: socket.socket, buf: bytes) -> None:
         while self.running:
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                self._handle_msg(pid, line)
             try:
                 data = conn.recv(4096)
             except socket.timeout:
@@ -293,61 +279,48 @@ class GameServer:
             buf += data
             if len(buf) > 65536:       # мусор/флуд
                 break
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                try:
-                    msg = json.loads(line)
-                    if msg.get("t") == "in":
-                        mx = int(msg.get("mx", 0))
-                        my = int(msg.get("my", 0))
-                        with self.lock:
-                            self.world.set_input(pid, mx, my)
-                            if msg.get("k"):
-                                self.world.queue_kick(pid)
-                except (ValueError, TypeError, AttributeError):
-                    continue
         self._drop(pid)
 
     def _drop(self, pid: int) -> None:
         with self.lock:
-            conn = self.clients.pop(pid, None)
+            client = self.clients.pop(pid, None)
             self.world.remove(pid)
-        if conn:
-            try:
-                conn.close()
-            except OSError:
-                pass
+        if client:
+            client.close()
 
     # ---- основной цикл симуляции
     def _tick_loop(self) -> None:
         last = time.perf_counter()
         acc = 0.0
-        last_send = 0.0
+        steps_since_send = 0
+        rv_sent = -1
         while self.running:
             now = time.perf_counter()
             acc = min(acc + (now - last), 0.25)
             last = now
 
             snap = None
-            targets = []
+            roster = None
+            targets: list[_Client] = []
             with self.lock:
-                stepped = False
                 while acc >= TICK:
                     self.world.step()
                     acc -= TICK
-                    stepped = True
-                if stepped and now - last_send >= SNAPSHOT_INTERVAL:
+                    steps_since_send += 1
+                if self.world.roster_version != rv_sent:
+                    rv_sent = self.world.roster_version
+                    roster = _encode(self._roster_msg())
+                if steps_since_send >= SNAPSHOT_STEPS:
                     snap = self.world.snapshot()
-                    targets = list(self.clients.items())
-                    last_send = now
+                    steps_since_send = 0
+                if roster is not None or snap is not None:
+                    targets = list(self.clients.values())
 
-            if snap is not None:
-                data = _encode(snap)
-                for pid, conn in targets:
-                    try:
-                        conn.sendall(data)
-                    except OSError:
-                        self._drop(pid)
+            for c in targets:
+                if roster is not None:
+                    c.send_ctrl(roster)
+                if snap is not None:
+                    c.send_snapshot(snap)
             time.sleep(0.003)
 
 
@@ -357,17 +330,25 @@ class GameServer:
 class NetSession:
     predict = True   # клиент предсказывает движение своего игрока
 
-    def __init__(self, host: str, port: int = PORT, timeout: float = 4.0):
+    def __init__(self, host: str, port: int = PORT, timeout: float = 4.0, name: str = ""):
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.settimeout(1.0)
         self.my_id = None
+        self.my_name = ""
         self.error = None
+        self.roster: dict = {}                 # pid -> (color, kind, name)
         self._alive = True
+        self._last_rx = time.monotonic()
         self._lock = threading.Lock()
         self._latest = None
         self._fresh = False
         self._events: list = []
+        try:
+            self.sock.sendall(_encode({"t": "hello", "v": PROTOCOL, "name": name}))
+        except OSError:
+            self.close()
+            raise
         threading.Thread(target=self._reader, daemon=True).start()
 
         deadline = time.perf_counter() + timeout
@@ -381,7 +362,7 @@ class NetSession:
 
     @property
     def alive(self) -> bool:
-        return self._alive
+        return self._alive and (time.monotonic() - self._last_rx) < SILENCE_TIMEOUT
 
     def _reader(self) -> None:
         buf = b""
@@ -406,20 +387,39 @@ class NetSession:
         self._alive = False
 
     def _handle(self, msg: dict) -> None:
+        self._last_rx = time.monotonic()
         t = msg.get("t")
         if t == "welcome":
+            if msg.get("v") != PROTOCOL:
+                self.error = ("у хоста другая версия игры — обновите файлы игры "
+                              "на всех компьютерах")
+                return
+            self.my_name = str(msg.get("name", ""))
             self.my_id = msg.get("id")
+        elif t == "bad_version":
+            self.error = (f"у хоста другая версия игры (у него v{msg.get('v')}, "
+                          f"у вас v{PROTOCOL}) — обновите файлы игры")
         elif t == "full":
             self.error = "сервер полон"
+        elif t == "roster":
+            try:
+                self.roster = {pid: (color, kind, name)
+                               for pid, color, kind, name in msg.get("p", [])}
+            except (TypeError, ValueError):
+                pass
         elif t == "s":
             with self._lock:
                 self._latest = msg
                 self._fresh = True
                 self._events.extend(msg.get("ev", []))
 
-    def send_input(self, mx: int, my: int, kick: bool = False) -> None:
+    def send_input(self, mx: int, my: int, kick: bool = False, claim=None) -> None:
+        msg = {"t": "in", "mx": mx, "my": my, "k": bool(kick)}
+        if kick and claim is not None:
+            msg["ox"] = round(claim[0], 2)
+            msg["oy"] = round(claim[1], 2)
         try:
-            self.sock.sendall(_encode({"t": "in", "mx": mx, "my": my, "k": bool(kick)}))
+            self.sock.sendall(_encode(msg))
         except OSError:
             self._alive = False
 
@@ -446,19 +446,29 @@ class LocalSession:
     """Игра с ботом: World крутится прямо в клиенте, без сети."""
     predict = False
 
-    def __init__(self):
+    def __init__(self, name: str = ""):
         self.world = World(spawn_extras=False)
-        me = self.world.add_human()
+        me = self.world.add_human(name)
         self.world.add_bot()          # стоячий бот
         self.my_id = me.pid
         self._acc = 0.0
         self._last = time.perf_counter()
+        self._rv = -1
+        self._roster: dict = {}
 
     @property
     def alive(self) -> bool:
         return True
 
-    def send_input(self, mx: int, my: int, kick: bool = False) -> None:
+    @property
+    def roster(self) -> dict:
+        if self._rv != self.world.roster_version:
+            self._rv = self.world.roster_version
+            self._roster = {pid: (color, kind, name)
+                            for pid, color, kind, name in self.world.roster()}
+        return self._roster
+
+    def send_input(self, mx: int, my: int, kick: bool = False, claim=None) -> None:
         self.world.set_input(self.my_id, mx, my)
         if kick:
             self.world.queue_kick(self.my_id)
@@ -484,6 +494,7 @@ if __name__ == "__main__":
     ap.add_argument("--ip", default="0.0.0.0",
                     help="адрес сети, в которой слушать (по умолчанию все)")
     ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--name", default="Сервер", help="название игры в списке найденных")
     ap.add_argument("--list", action="store_true", help="показать доступные сети и выйти")
     args = ap.parse_args()
 
@@ -492,10 +503,10 @@ if __name__ == "__main__":
             print(f"{i.ip:<16} {i.title.split('   ')[0]:<22} {i.name}")
         raise SystemExit(0)
 
-    server = GameServer(args.port, host=args.ip)
+    server = GameServer(args.port, host=args.ip, name=args.name)
     server.start()
     shown = local_ip() if args.ip == "0.0.0.0" else args.ip
-    print(f"Сервер запущен: {shown}:{args.port}  (Ctrl+C — остановить)")
+    print(f"Сервер запущен: {shown}:{server.port}  (Ctrl+C — остановить)")
     try:
         while True:
             time.sleep(1.0)
